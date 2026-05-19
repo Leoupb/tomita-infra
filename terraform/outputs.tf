@@ -23,9 +23,14 @@ output "private_subnet_ids" {
   value       = [aws_subnet.private_1.id, aws_subnet.private_2.id]
 }
 
-output "asg_name" {
-  description = "Nombre del Auto Scaling Group"
-  value       = aws_autoscaling_group.app.name
+output "ec2_instance_1_id" {
+  description = "ID de la instancia EC2 en us-east-1a"
+  value       = aws_instance.app_1.id
+}
+
+output "ec2_instance_2_id" {
+  description = "ID de la instancia EC2 en us-east-1b"
+  value       = aws_instance.app_2.id
 }
 
 output "rds_primary_endpoint" {

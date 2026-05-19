@@ -1,132 +1,72 @@
 #!/bin/bash
-set -e
+set -ex
 
-# ─────────────────────────────────────────────
-# Variables inyectadas por Terraform templatefile
-# ─────────────────────────────────────────────
 DB_HOST="${db_host}"
 DB_USER="${db_user}"
 DB_PASSWORD="${db_password}"
 DB_NAME="${db_name}"
 REGION="${region}"
 
-# ─────────────────────────────────────────────
-# 1. Actualizar sistema e instalar dependencias
-# ─────────────────────────────────────────────
-yum update -y
-curl -fsSL https://rpm.nodesource.com/setup_18.x | bash -
-yum install -y nodejs git
+# 1. Instalar Node.js (AL2023 lo tiene en repos nativos)
+dnf install -y nodejs
 
-# Instalar PM2 globalmente para gestión de procesos
-npm install -g pm2
-
-# ─────────────────────────────────────────────
-# 2. Clonar el repositorio de la aplicación
-# ─────────────────────────────────────────────
+# 2. Crear la app directamente (sin git clone)
 mkdir -p /opt/tomita-api
 cd /opt/tomita-api
 
-# Clonar desde GitHub (repositorio público)
-git clone https://github.com/TU_USUARIO/tomita-infra.git . 2>/dev/null || \
-  git pull origin main 2>/dev/null || true
-
-cd /opt/tomita-api/app
-npm install --production
-
-# ─────────────────────────────────────────────
-# 3. Configurar variables de entorno
-# ─────────────────────────────────────────────
-cat > /opt/tomita-api/app/.env <<EOF
-NODE_ENV=production
-PORT=3000
-DB_HOST=$DB_HOST
-DB_USER=$DB_USER
-DB_PASSWORD=$DB_PASSWORD
-DB_NAME=$DB_NAME
-AWS_REGION=$REGION
-EOF
-
-# Obtener ID de la instancia desde metadata
-INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo "unknown")
-echo "INSTANCE_ID=$INSTANCE_ID" >> /opt/tomita-api/app/.env
-
-# ─────────────────────────────────────────────
-# 4. Inicializar base de datos (primera vez)
-# ─────────────────────────────────────────────
-sleep 30  # Esperar a que RDS esté disponible
-
-# Script de inicialización DB
-node - <<'INITDB'
-const mysql = require('mysql2/promise');
-const fs = require('fs');
-require('dotenv').config({ path: '/opt/tomita-api/app/.env' });
-
-async function init() {
-  try {
-    const conn = await mysql.createConnection({
-      host: process.env.DB_HOST,
-      user: process.env.DB_USER,
-      password: process.env.DB_PASSWORD,
-    });
-    await conn.query(`CREATE DATABASE IF NOT EXISTS ${process.env.DB_NAME}`);
-    await conn.query(`USE ${process.env.DB_NAME}`);
-    await conn.query(`
-      CREATE TABLE IF NOT EXISTS productos (
-        id      INT AUTO_INCREMENT PRIMARY KEY,
-        nombre  VARCHAR(100) NOT NULL,
-        precio  DECIMAL(10,2) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-    await conn.query(`
-      INSERT IGNORE INTO productos (id, nombre, precio) VALUES
-        (1, 'Pintura Blanco Hueso',  2500),
-        (2, 'Pintura Azul Celeste',  3200),
-        (3, 'Pintura Blanco Mate',   2800),
-        (4, 'Pintura Verde',         3120),
-        (5, 'Pintura Lila',          2800)
-    `);
-    console.log('Base de datos inicializada correctamente');
-    await conn.end();
-  } catch (err) {
-    console.error('DB init error (no critico):', err.message);
-  }
-}
-init();
-INITDB
-
-# ─────────────────────────────────────────────
-# 5. Iniciar aplicación con PM2
-# ─────────────────────────────────────────────
-cd /opt/tomita-api/app
-pm2 start src/app.js --name "tomita-api" --env production
-pm2 startup systemd -u ec2-user --hp /home/ec2-user
-pm2 save
-
-# ─────────────────────────────────────────────
-# 6. Instalar CloudWatch Agent
-# ─────────────────────────────────────────────
-yum install -y amazon-cloudwatch-agent
-
-cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCONF
+cat > package.json <<'PKGJSON'
 {
-  "agent": { "metrics_collection_interval": 60 },
-  "metrics": {
-    "append_dimensions": {
-      "AutoScalingGroupName": "\${aws:AutoScalingGroupName}",
-      "InstanceId": "\${aws:InstanceId}"
-    },
-    "metrics_collected": {
-      "cpu":    { "measurement": ["cpu_usage_active"], "metrics_collection_interval": 60 },
-      "mem":    { "measurement": ["mem_used_percent"],  "metrics_collection_interval": 60 },
-      "disk":   { "measurement": ["disk_used_percent"], "resources": ["/"], "metrics_collection_interval": 60 }
-    }
-  }
+  "name": "tomita-api",
+  "version": "1.0.0",
+  "dependencies": { "express": "^4.18.2" }
 }
-CWCONF
+PKGJSON
 
-/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-  -a fetch-config -m ec2 \
-  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+npm install
 
-echo "Bootstrap completado - Tomita API iniciada"
+# 3. Crear el servidor
+INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo "unknown")
+HOSTNAME=$(hostname)
+
+cat > app.js <<APPJS
+const express = require('express');
+const app = express();
+app.use(express.json());
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString(), hostname: '$HOSTNAME', instance: '$INSTANCE_ID' });
+});
+
+app.get('/status', (req, res) => {
+  res.json({ status: 'running', uptime: Math.floor(process.uptime()), hostname: '$HOSTNAME', instance: '$INSTANCE_ID', db_host: '$DB_HOST' });
+});
+
+app.get('/api/test', (req, res) => {
+  res.json({ message: 'API Tomita funcionando correctamente', version: '1.0.0', server: '$HOSTNAME' });
+});
+
+app.get('/api/productos', (req, res) => {
+  res.json({ productos: [
+    { id: 1, nombre: 'Pintura Blanco Hueso', precio: 2500 },
+    { id: 2, nombre: 'Pintura Azul Celeste', precio: 3200 },
+    { id: 3, nombre: 'Pintura Blanco Mate', precio: 2800 },
+    { id: 4, nombre: 'Pintura Verde', precio: 3120 },
+    { id: 5, nombre: 'Pintura Lila', precio: 2800 }
+  ]});
+});
+
+app.post('/api/productos', (req, res) => {
+  const { nombre, precio } = req.body;
+  if (!nombre || !precio) return res.status(400).json({ error: 'nombre y precio requeridos' });
+  res.status(201).json({ id: Date.now(), nombre, precio });
+});
+
+app.listen(3000, () => console.log('Tomita API en puerto 3000 | ' + '$HOSTNAME'));
+APPJS
+
+# 4. Iniciar la app (nohup para que persista)
+nohup node app.js > /var/log/tomita-api.log 2>&1 &
+sleep 2
+curl -s http://localhost:3000/health && echo " -> App OK" || echo " -> App FALLO"
+
+echo "Bootstrap completado - Tomita API iniciada en puerto 3000"

@@ -71,7 +71,6 @@ resource "aws_route_table_association" "public_2" {
 # SECURITY GROUPS
 # ═══════════════════════════════════════════════════════════════
 
-# SG-ALB: sólo tráfico HTTP desde Internet
 resource "aws_security_group" "alb" {
   name        = "${var.project_name}-sg-alb"
   description = "Permite HTTP desde Internet hacia el ALB"
@@ -95,7 +94,6 @@ resource "aws_security_group" "alb" {
   tags = { Name = "${var.project_name}-sg-alb" }
 }
 
-# SG-EC2: solo tráfico desde ALB en puerto 3000 + SSH administración
 resource "aws_security_group" "ec2" {
   name        = "${var.project_name}-sg-ec2"
   description = "Permite trafico del ALB al puerto 3000 de las instancias"
@@ -114,7 +112,7 @@ resource "aws_security_group" "ec2" {
     to_port     = 22
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "SSH administracion (restringir IP en produccion)"
+    description = "SSH administracion"
   }
 
   egress {
@@ -127,7 +125,6 @@ resource "aws_security_group" "ec2" {
   tags = { Name = "${var.project_name}-sg-ec2" }
 }
 
-# SG-RDS: sólo tráfico MySQL desde las instancias EC2
 resource "aws_security_group" "rds" {
   name        = "${var.project_name}-sg-rds"
   description = "Permite MySQL 3306 solo desde EC2 privado"
@@ -149,37 +146,6 @@ resource "aws_security_group" "rds" {
   }
 
   tags = { Name = "${var.project_name}-sg-rds" }
-}
-
-# ═══════════════════════════════════════════════════════════════
-# IAM — Rol para EC2: CloudWatch Agent + SSM
-# ═══════════════════════════════════════════════════════════════
-resource "aws_iam_role" "ec2_role" {
-  name = "${var.project_name}-ec2-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action    = "sts:AssumeRole"
-      Effect    = "Allow"
-      Principal = { Service = "ec2.amazonaws.com" }
-    }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "cloudwatch" {
-  role       = aws_iam_role.ec2_role.name
-  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
-}
-
-resource "aws_iam_role_policy_attachment" "ssm" {
-  role       = aws_iam_role.ec2_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
-}
-
-resource "aws_iam_instance_profile" "ec2_profile" {
-  name = "${var.project_name}-ec2-profile"
-  role = aws_iam_role.ec2_role.name
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -224,68 +190,67 @@ resource "aws_lb_listener" "http" {
 }
 
 # ═══════════════════════════════════════════════════════════════
-# LAUNCH TEMPLATE + AUTO SCALING GROUP
+# EC2 INSTANCES (2 en AZs distintas → alta disponibilidad)
 # ═══════════════════════════════════════════════════════════════
-resource "aws_launch_template" "app" {
-  name_prefix   = "${var.project_name}-lt-"
-  image_id      = var.ami_id
-  instance_type = var.instance_type
-  key_name      = var.key_name
-
+resource "aws_instance" "app_1" {
+  ami                    = var.ami_id
+  instance_type          = var.instance_type
+  key_name               = var.key_name
+  subnet_id              = aws_subnet.public_1.id
   vpc_security_group_ids = [aws_security_group.ec2.id]
 
-  iam_instance_profile {
-    name = aws_iam_instance_profile.ec2_profile.name
-  }
-
-  user_data = base64encode(templatefile("${path.module}/user_data.sh", {
+  user_data = templatefile("${path.module}/user_data.sh", {
     db_host     = aws_db_instance.primary.address
     db_user     = var.db_username
     db_password = var.db_password
     db_name     = var.db_name
     region      = var.aws_region
-  }))
+  })
 
-  tag_specifications {
-    resource_type = "instance"
-    tags = { Name = "${var.project_name}-ec2" }
+  tags = { Name = "${var.project_name}-ec2-1a" }
+
+  root_block_device {
+    volume_type = "gp2"
+    volume_size = 8
+    encrypted   = false
   }
 }
 
-resource "aws_autoscaling_group" "app" {
-  name                      = "${var.project_name}-asg"
-  min_size                  = var.asg_min_size
-  max_size                  = var.asg_max_size
-  desired_capacity          = var.asg_desired
-  vpc_zone_identifier       = [aws_subnet.public_1.id, aws_subnet.public_2.id]
-  target_group_arns         = [aws_lb_target_group.app.arn]
-  health_check_type         = "ELB"
-  health_check_grace_period = 120
+resource "aws_instance" "app_2" {
+  ami                    = var.ami_id
+  instance_type          = var.instance_type
+  key_name               = var.key_name
+  subnet_id              = aws_subnet.public_2.id
+  vpc_security_group_ids = [aws_security_group.ec2.id]
 
-  launch_template {
-    id      = aws_launch_template.app.id
-    version = "$Latest"
-  }
+  user_data = templatefile("${path.module}/user_data.sh", {
+    db_host     = aws_db_instance.primary.address
+    db_user     = var.db_username
+    db_password = var.db_password
+    db_name     = var.db_name
+    region      = var.aws_region
+  })
 
-  tag {
-    key                 = "Name"
-    value               = "${var.project_name}-instance"
-    propagate_at_launch = true
+  tags = { Name = "${var.project_name}-ec2-1b" }
+
+  root_block_device {
+    volume_type = "gp2"
+    volume_size = 8
+    encrypted   = false
   }
 }
 
-# Política de escalado por CPU
-resource "aws_autoscaling_policy" "cpu_tracking" {
-  name                   = "${var.project_name}-cpu-policy"
-  autoscaling_group_name = aws_autoscaling_group.app.name
-  policy_type            = "TargetTrackingScaling"
+# Registrar instancias en el Target Group del ALB
+resource "aws_lb_target_group_attachment" "app_1" {
+  target_group_arn = aws_lb_target_group.app.arn
+  target_id        = aws_instance.app_1.id
+  port             = 3000
+}
 
-  target_tracking_configuration {
-    predefined_metric_specification {
-      predefined_metric_type = "ASGAverageCPUUtilization"
-    }
-    target_value = 70.0
-  }
+resource "aws_lb_target_group_attachment" "app_2" {
+  target_group_arn = aws_lb_target_group.app.arn
+  target_id        = aws_instance.app_2.id
+  port             = 3000
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -328,10 +293,10 @@ resource "aws_db_instance" "replica" {
 }
 
 # ═══════════════════════════════════════════════════════════════
-# CLOUDWATCH — Alarmas básicas
+# CLOUDWATCH — Alarmas
 # ═══════════════════════════════════════════════════════════════
-resource "aws_cloudwatch_metric_alarm" "high_cpu" {
-  alarm_name          = "${var.project_name}-high-cpu"
+resource "aws_cloudwatch_metric_alarm" "high_cpu_1" {
+  alarm_name          = "${var.project_name}-high-cpu-1a"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
   metric_name         = "CPUUtilization"
@@ -339,9 +304,24 @@ resource "aws_cloudwatch_metric_alarm" "high_cpu" {
   period              = 60
   statistic           = "Average"
   threshold           = 70
-  alarm_description   = "CPU supera 70% en instancias del ASG"
+  alarm_description   = "CPU supera 70% en instancia 1a"
   dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.app.name
+    InstanceId = aws_instance.app_1.id
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "high_cpu_2" {
+  alarm_name          = "${var.project_name}-high-cpu-1b"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 70
+  alarm_description   = "CPU supera 70% en instancia 1b"
+  dimensions = {
+    InstanceId = aws_instance.app_2.id
   }
 }
 
